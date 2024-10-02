@@ -1,0 +1,129 @@
+library(tidyverse)
+library(tidymodels)
+library(vroom)
+library(skimr)
+library(GGally)
+library(ggplot2)
+library(glmnet)
+library(stacks)
+
+train_data <- vroom("files/train.csv") 
+test_data <- vroom("files/test.csv")
+
+train_data <- train_data %>%
+  select(-registered, -casual) %>%
+  mutate(count = log(count))
+
+# make split for CV
+folds <- vfold_cv(train_data, v = 5, repeats=1)
+
+# create control grid
+untunedModel <- control_stack_grid()
+tunedModel <- control_stack_resamples()
+
+# recipe
+bike_recipe <- recipe(count ~ ., data = train_data) %>%
+  step_date(datetime, features = "month") %>%
+  step_time(datetime, features = "hour") %>%
+  step_mutate(
+    weather = if_else(weather == 4, 3, weather),
+    weather = as.factor(weather),
+    season = as.factor(season),
+    workingday = as.factor(workingday),
+    holiday = as.factor(holiday), 
+    datetime_month = as.factor(datetime_month)
+  ) %>%
+  step_rm(datetime) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# penalized regression model
+preg_model <- linear_reg(penalty=tune(), 
+                         mixture=tune()) %>%
+  set_engine("glmnet")
+
+# set workflow
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(preg_model)
+
+# grid of values to tune over
+preg_tuning_grid <- grid_regular(penalty(), 
+                                 mixture(), 
+                                 levels = 4)
+# run CV
+preg_models <- preg_wf %>%
+  tune_grid(resamples = folds,
+            grid = preg_tuning_grid, 
+            metrics = metric_set(rmse, mae, rsq), 
+            control = untunedModel)
+
+# regular linear regression model
+lin_model <- linear_reg() %>%
+  set_engine("lm") 
+
+# wf
+lin_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(lin_model)
+
+# model
+lin_reg_model <- fit_resamples(
+  lin_wf, 
+  resamples = folds,
+  metrics = metric_set(rmse), 
+  control = tunedModel
+)
+
+# tree regression model
+tree_model <- decision_tree(tree_depth = tune(), 
+                            cost_complexity = tune(),
+                            min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+#wf
+tree_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(tree_model)
+
+# tuning grid
+tuning_params <- grid_regular(tree_depth(), 
+                              cost_complexity(),
+                              min_n(),
+                              levels = 4)
+
+# run CV
+tree_models <- tree_wf %>%
+  tune_grid(resamples=folds,
+            grid=tuning_params,
+            metrics=metric_set(rmse, mae, rsq), 
+            control = untunedModel)
+
+
+
+
+# create stack with models
+bike_stack <- stacks() %>%
+  add_candidates(preg_models) %>%
+  add_candidates(lin_reg_model) %>%
+  add_candidates(tree_models)
+
+# fit stack
+stack_model <- bike_stack %>%
+  blend_predictions() %>%
+  fit_members()
+
+# make predictions
+predictions <- stack_model %>%
+  predict(new_data = test_data)
+
+kaggle_submission <- predictions %>%
+  bind_cols(., test_data) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and prediction variables
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count = exp(count)) %>% 
+  mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
+
+vroom_write(x=kaggle_submission, file="./StackPreds.csv", delim=",")
+

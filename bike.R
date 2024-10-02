@@ -2,72 +2,72 @@ library(tidyverse)
 library(tidymodels)
 library(vroom)
 library(skimr)
-library(train_dataExplorer)
 library(GGally)
 library(ggplot2)
+library(glmnet)
 
-# EDA
-train_data <- vroom("files/train.csv", )
-train_data$weather <- as.factor(train_data$weather)
-train_data$season <- as.factor(train_data$season)
-glimpse(train_data)
-skim(train_data)
-plot_intro(train_data)
-plot_correlation(train_data)
-plot_bar(train_data)
-plot_histogram(train_data)
-plot_missing(train_data)
-ggpairs(train_data)
-head(train_data)
+train_data <- vroom("files/train.csv", ) # read in data
 
-plot1 <- ggplot(data = train_data, mapping= aes(x = weather)) +
-  geom_bar(aes(fill = weather)) +
-  ggtitle("Bar Plot of Weather") +
-  theme(plot.title = element_text(hjust = 0.5))
+# remove registered and casual columns, change count to log(count)
+train_data <- train_data %>%
+  select(-registered, -casual)
 
+# write recipe for data wrangling
+bike_recipe <- recipe(count ~ ., data = train_data) %>%
+  step_mutate(weather = if_else(weather == 4, 3, weather)) %>%
+  step_mutate(weather = as.factor(weather)) %>%
+  step_mutate(season = as.factor(season)) %>%
+  step_mutate(workingday = as.factor(workingday)) %>%
+  step_mutate(holiday = as.factor(holiday)) %>%
+  step_time(datetime, features = "hour") %>%
+  step_mutate(datetime_hour = as.factor(datetime_hour)) %>%
+  step_date(datetime, features = "month") %>%
+  step_mutate(datetime_month = as.factor(datetime_month)) %>%
+  step_select(-datetime) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 
-plot2 <- ggplot(data = train_data, mapping = aes(x=temp)) +
-  geom_histogram(binwidth = 3, fill = 'orchid1', color = 'black') +
-  ggtitle("Distribution of Temperature") +
-  theme(plot.title = element_text(hjust = 0.5))
+bike_recipe2 <- recipe(count ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_nominal_predictors())
+  
+prepped <- prep(bike_recipe)
+prepped2 <- prep(bike_recipe2)
+bake(prepped, new_data=train_data)
+# define a model
+poisson_model <- poisson_reg() %>% # Type of model
+  set_engine("glm") %>% # Engine = What R function to use
+  set_mode("regression") 
 
-humidityplot <- ggplot(data = train_data, mapping= aes(x = humidity, y = count)) +
-  geom_point() +
-  geom_smooth(se=FALSE) + 
-  ggtitle("Scatter Plot of Humidity") +
-  theme(plot.title = element_text(hjust = 0.5))
+# penalized linear regression model
+preg_model <- linear_reg(penalty=3, mixture=0.5) %>%
+  set_engine("glmnet")
 
-ggplot() +
-  geom_boxplot(data = train_data, aes(x = registered, fill = "Registered")) +
-  geom_boxplot(data = train_data, aes(x = casual, fill = "Casual")) +
-  labs(x = "Working Day", y = "Count", fill = "Type") +
-  ggtitle("Boxplot of Registered and Casual Counts by Working Day") +
-  theme(plot.title = element_text(hjust = 0.5))
+# combine into a workflow
+bike_flow <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(poisson_model) %>%
+  fit(data=train_data)
 
-ggplot() +
-  geom_boxplot(data = train_data, aes(y = registered)) +
-  geom_boxplot(data = train_data, aes(y = casual))
-
-plot4 <- ggplot() +
-  geom_point(data = train_data, mapping = aes(x = datetime, y = count, color = factor(workingday))) +
-  ggtitle("Scatterplot of Daily Count Colored by Workingday") +
-  theme(plot.title = element_text(hjust = 0.5))
-
-library(patchwork)
-
-(plot1 + plot2) / (humidityplot + plot4)
-
-
-
-# Set up and Fit the Linear Model
-model <- linear_reg() %>% # Type of model
-  set_engine("lm") %>% # Engine = What R function to use
-  set_mode("regression") %>% # Regression here means quantitative response
-  fit(formula=log(count)~holiday+workingday+temp+atemp+humidity+windspeed+season+weather, data=train_data)
-
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe2) %>%
+  add_model(preg_model) %>%
+  fit(data=train_data)
 
 # read in test data
 test_data <- vroom("files/test.csv")
+
+
+# run all the steps on test data
+penalized_preds <- predict(preg_wf, new_data=test_data)
+
+
+
+
+
+
+
+
 test_data$season <- as.factor(test_data$season)
 test_data$weather <- as.factor(test_data$weather)
 
@@ -80,7 +80,7 @@ bike_predictions <- exp(bike_predictions) # back transform log
 
 
 # format for kaggle
-kaggle_submission <- bike_predictions %>%
+kaggle_submission <- pois_preds %>%
 bind_cols(., test_data) %>% #Bind predictions with test data
   select(datetime, .pred) %>% #Just keep datetime and prediction variables
   rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
@@ -88,31 +88,31 @@ bind_cols(., test_data) %>% #Bind predictions with test data
   mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
 
 ## Write out the file
-vroom_write(x=kaggle_submission, file="./LinearPreds.csv", delim=",")
+vroom_write(x=kaggle_submission, file="./RecipePoissonPreds.csv", delim=",")
 
 
-## POISSON LINEAR MODEL
-library(poissonreg)
-
-pois_model <- poisson_reg() %>%
-  set_engine("glm") %>%
-  set_mode("regression") %>%
-  fit(formula = count~holiday+workingday+temp+atemp+humidity+windspeed+season+weather, data = train_data)
-
-poisson_predictions <- predict(pois_model, 
-                            new_data = test_data)
-poisson_predictions
-
-# format for kaggle
-kaggle_submission_pois <- poisson_predictions %>%
-  bind_cols(., test_data) %>% #Bind predictions with test data
-  select(datetime, .pred) %>% #Just keep datetime and prediction variables
-  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
-  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
-  mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
-
-## Write out the file
-vroom_write(x=kaggle_submission_pois, file="./PoissonLinearPreds.csv", delim=",")
+# ## POISSON LINEAR MODEL
+# library(poissonreg)
+# 
+# pois_model <- poisson_reg() %>%
+#   set_engine("glm") %>%
+#   set_mode("regression") %>%
+#   fit(formula = count~holiday+workingday+temp+atemp+humidity+windspeed+season+weather, data = train_data)
+# 
+# poisson_predictions <- predict(pois_model, 
+#                             new_data = test_data)
+# poisson_predictions
+# 
+# # format for kaggle
+# kaggle_submission_pois <- poisson_predictions %>%
+#   bind_cols(., test_data) %>% #Bind predictions with test data
+#   select(datetime, .pred) %>% #Just keep datetime and prediction variables
+#   rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+#   mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+#   mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
+# 
+# ## Write out the file
+# vroom_write(x=kaggle_submission_pois, file="./PoissonLinearPreds.csv", delim=",")
 
 
 
